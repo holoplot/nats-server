@@ -392,6 +392,7 @@ type subjectFilter struct {
 	pmsg        *jsPubMsg
 	err         error
 	hasWildcard bool
+	ts          [32]string // tokenized filter subject
 }
 
 type subjectFilters []*subjectFilter
@@ -939,6 +940,7 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 			subject:     filter,
 			hasWildcard: subjectHasWildcard(filter),
 		}
+		tokenizeSubjectIntoSlice(sub.ts[:0], filter)
 		o.subjf = append(o.subjf, sub)
 	}
 
@@ -1871,6 +1873,7 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 				}
 				continue
 			}
+			tokenizeSubjectIntoSlice(fs.ts[:0], newFilter)
 			newSubjf = append(newSubjf, fs)
 		}
 		// Make sure we have correct signaling setup.
@@ -3363,11 +3366,8 @@ func (o *consumer) isFilteredMatch(subj string) bool {
 	// iterate again to check for subset match.
 	tsa := [32]string{}
 	tts := tokenizeSubjectIntoSlice(tsa[:0], subj)
-
-	fsa := [32]string{}
 	for _, filter := range o.subjf {
-		fts := tokenizeSubjectIntoSlice(fsa[:0], filter.subject)
-		if isSubsetMatchTokenized(tts, fts) {
+		if isSubsetMatchTokenized(tts, filter.ts[:0]) {
 			return true
 		}
 	}
