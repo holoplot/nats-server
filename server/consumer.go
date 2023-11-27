@@ -3361,9 +3361,13 @@ func (o *consumer) isFilteredMatch(subj string) bool {
 	}
 	// It's quicker to first check for non-wildcard filters, then
 	// iterate again to check for subset match.
-	// TODO(dlc) at speed might be better to just do a sublist with L2 and/or possibly L1.
+	tsa := [32]string{}
+	tts := tokenizeSubjectIntoSlice(tsa[:0], subj)
+
+	fsa := [32]string{}
 	for _, filter := range o.subjf {
-		if subjectIsSubsetMatch(subj, filter.subject) {
+		fts := tokenizeSubjectIntoSlice(fsa[:0], filter.subject)
+		if isSubsetMatchTokenized(tts, fts) {
 			return true
 		}
 	}
