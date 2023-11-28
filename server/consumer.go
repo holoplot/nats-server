@@ -3949,8 +3949,10 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 			}
 		} else {
 			if o.subjf != nil {
+				tsa := [32]string{}
+				tts := tokenizeSubjectIntoSlice(tsa[:0], pmsg.subj)
 				for i, filter := range o.subjf {
-					if subjectIsSubsetMatch(pmsg.subj, filter.subject) {
+					if isSubsetMatchTokenized(tts, filter.ts[:0]) {
 						o.subjf[i].currentSeq--
 						o.subjf[i].nextSeq--
 						break
