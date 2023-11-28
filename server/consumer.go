@@ -29,6 +29,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server/avl"
+	"github.com/nats-io/nats-server/v2/subject"
 	"github.com/nats-io/nuid"
 	"golang.org/x/time/rate"
 )
@@ -386,21 +387,19 @@ type consumer struct {
 
 // A single subject filter.
 type subjectFilter struct {
-	subject     string
-	nextSeq     uint64
-	currentSeq  uint64
-	pmsg        *jsPubMsg
-	err         error
-	hasWildcard bool
-	ts          [32]string // tokenized filter subject
+	subject    *subject.Subject
+	nextSeq    uint64
+	currentSeq uint64
+	pmsg       *jsPubMsg
+	err        error
 }
 
 type subjectFilters []*subjectFilter
 
 // subjects is a helper function used for updating consumers.
 // It is not used and should not be used in hotpath.
-func (s subjectFilters) subjects() []string {
-	subjects := make([]string, 0, len(s))
+func (s subjectFilters) subjects() []*subject.Subject {
+	subjects := make([]*subject.Subject, 0, len(s))
 	for _, filter := range s {
 		subjects = append(subjects, filter.subject)
 	}
@@ -581,25 +580,22 @@ func checkConsumerCfg(
 		return NewJSConsumerDuplicateFilterSubjectsError()
 	}
 
-	if config.FilterSubject != _EMPTY_ && !IsValidSubject(config.FilterSubject) {
-		return NewJSStreamInvalidConfigError(ErrBadSubject)
-	}
-
 	// We treat FilterSubjects: []string{""} as a misconfig, so we validate against it.
 	for _, filter := range config.FilterSubjects {
 		if filter == _EMPTY_ {
 			return NewJSConsumerEmptyFilterError()
 		}
 	}
-	subjectFilters := gatherSubjectFilters(config.FilterSubject, config.FilterSubjects)
+
+	subjectFilters, err := gatherSubjectFilters(config)
+	if err != nil {
+		return NewJSStreamInvalidConfigError(err)
+	}
 
 	// Check subject filters overlap.
 	for outer, subject := range subjectFilters {
-		if !IsValidSubject(subject) {
-			return NewJSStreamInvalidConfigError(ErrBadSubject)
-		}
 		for inner, ssubject := range subjectFilters {
-			if inner != outer && subjectIsSubsetMatch(subject, ssubject) {
+			if inner != outer && subject.IsSubsetMatch(ssubject) {
 				return NewJSConsumerOverlappingSubjectFiltersError()
 			}
 		}
@@ -721,6 +717,11 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 		return nil, NewJSConsumerConfigRequiredError()
 	}
 
+	subjects, err := gatherSubjectFilters(config)
+	if err != nil {
+		return nil, NewJSStreamInvalidConfigError(err)
+	}
+
 	jsa.usageMu.RLock()
 	selectedLimits, limitsFound := jsa.limits[tierName]
 	jsa.usageMu.RUnlock()
@@ -780,7 +781,6 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 			}
 			// Check for overlapping subjects.
 			if mset.cfg.Retention == WorkQueuePolicy {
-				subjects := gatherSubjectFilters(config.FilterSubject, config.FilterSubjects)
 				if !mset.partitionUnique(cName, subjects) {
 					return nil, NewJSConsumerWQConsumerNotUniqueError()
 				}
@@ -819,7 +819,6 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 		}
 
 		if len(mset.consumers) > 0 {
-			subjects := gatherSubjectFilters(config.FilterSubject, config.FilterSubjects)
 			if len(subjects) == 0 {
 				mset.mu.Unlock()
 				return nil, NewJSConsumerWQMultipleUnfilteredError()
@@ -934,13 +933,10 @@ func (mset *stream) addConsumerWithAssignment(config *ConsumerConfig, oname stri
 		o.store = store
 	}
 
-	subjects := gatherSubjectFilters(o.cfg.FilterSubject, o.cfg.FilterSubjects)
 	for _, filter := range subjects {
 		sub := &subjectFilter{
-			subject:     filter,
-			hasWildcard: subjectHasWildcard(filter),
+			subject: filter,
 		}
-		tokenizeSubjectIntoSlice(sub.ts[:0], filter)
 		o.subjf = append(o.subjf, sub)
 	}
 
@@ -1855,13 +1851,15 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 	}
 
 	// Check for Subject Filters update.
-	newSubjects := gatherSubjectFilters(cfg.FilterSubject, cfg.FilterSubjects)
+	newSubjects, err := gatherSubjectFilters(cfg)
+	if err != nil {
+		return NewJSStreamInvalidConfigError(err)
+	}
 	if !subjectSliceEqual(newSubjects, o.subjf.subjects()) {
 		newSubjf := make(subjectFilters, 0, len(newSubjects))
 		for _, newFilter := range newSubjects {
 			fs := &subjectFilter{
-				subject:     newFilter,
-				hasWildcard: subjectHasWildcard(newFilter),
+				subject: newFilter,
 			}
 			// If given subject was present, we will retain its fields values
 			// so `getNextMgs` can take advantage of already buffered `pmsgs`.
@@ -1873,7 +1871,6 @@ func (o *consumer) updateConfig(cfg *ConsumerConfig) error {
 				}
 				continue
 			}
-			tokenizeSubjectIntoSlice(fs.ts[:0], newFilter)
 			newSubjf = append(newSubjf, fs)
 		}
 		// Make sure we have correct signaling setup.
@@ -2777,11 +2774,11 @@ func (o *consumer) isFiltered() bool {
 	}
 
 	// `isFiltered` need to be performant, so we do
-	// as any checks as possible to avoid unnecessary work.
+	// as many checks as possible to avoid unnecessary work.
 	// Here we avoid iteration over slices if there is only one subject in stream
 	// and one filter for the consumer.
 	if len(mset.cfg.Subjects) == 1 && len(o.subjf) == 1 {
-		return mset.cfg.Subjects[0] != o.subjf[0].subject
+		return mset.cfg.Subjects[0] != o.subjf[0].subject.String()
 	}
 
 	// if the list is not equal length, we can return early, as this is filtered.
@@ -2795,7 +2792,7 @@ func (o *consumer) isFiltered() bool {
 	// so it can't be used here.
 	cfilters := make(map[string]struct{}, len(o.subjf))
 	for _, val := range o.subjf {
-		cfilters[val.subject] = struct{}{}
+		cfilters[val.subject.String()] = struct{}{}
 	}
 	for _, val := range mset.cfg.Subjects {
 		if _, ok := cfilters[val]; !ok {
@@ -3358,17 +3355,17 @@ func (o *consumer) isFilteredMatch(subj string) bool {
 		return true
 	}
 	for _, filter := range o.subjf {
-		if !filter.hasWildcard && subj == filter.subject {
+		if !filter.subject.HasWildcard() && subj == filter.subject.String() {
 			return true
 		}
 	}
 	// It's quicker to first check for non-wildcard filters, then
 	// iterate again to check for subset match.
-	tsa := [32]string{}
-	tts := tokenizeSubjectIntoSlice(tsa[:0], subj)
-	for _, filter := range o.subjf {
-		if isSubsetMatchTokenized(tts, filter.ts[:0]) {
-			return true
+	if subj, err := subject.New(subj); err != nil {
+		for _, filter := range o.subjf {
+			if subj.IsSubsetMatch(filter.subject) {
+				return true
+			}
 		}
 	}
 	return false
@@ -3477,7 +3474,7 @@ func (o *consumer) getNextMsg() (*jsPubMsg, uint64, error) {
 		// if this subject didn't fetch any message before, do it now
 		if filter.pmsg == nil {
 			// We will unlock here in case lots of contention, e.g. WQ.
-			filterSubject, filterWC, nextSeq := filter.subject, filter.hasWildcard, filter.nextSeq
+			filterSubject, filterWC, nextSeq := filter.subject.String(), filter.subject.HasWildcard(), filter.nextSeq
 			o.mu.Unlock()
 			pmsg := getJSPubMsgFromPool()
 			sm, sseq, err := store.LoadNextMsg(filterSubject, filterWC, nextSeq, &pmsg.StoreMsg)
@@ -3949,13 +3946,13 @@ func (o *consumer) loopAndGatherMsgs(qch chan struct{}) {
 			}
 		} else {
 			if o.subjf != nil {
-				tsa := [32]string{}
-				tts := tokenizeSubjectIntoSlice(tsa[:0], pmsg.subj)
-				for i, filter := range o.subjf {
-					if isSubsetMatchTokenized(tts, filter.ts[:0]) {
-						o.subjf[i].currentSeq--
-						o.subjf[i].nextSeq--
-						break
+				if subj, err := subject.New(pmsg.subj); err != nil {
+					for i, filter := range o.subjf {
+						if subj.IsSubsetMatch(filter.subject) {
+							o.subjf[i].currentSeq--
+							o.subjf[i].nextSeq--
+							break
+						}
 					}
 				}
 			}
@@ -4161,7 +4158,7 @@ func (o *consumer) streamNumPending() uint64 {
 		}
 		// Consumer with filters.
 		for _, filter := range o.subjf {
-			npc, npf := o.mset.store.NumPending(o.sseq, filter.subject, isLastPerSubject)
+			npc, npf := o.mset.store.NumPending(o.sseq, filter.subject.String(), isLastPerSubject)
 			o.npc += int64(npc)
 			if npf > o.npf {
 				o.npf = npf // Always last
@@ -4183,7 +4180,7 @@ func (o *consumer) streamNumPending() uint64 {
 		if filter.currentSeq < o.sseq {
 			filter.currentSeq = o.sseq
 		}
-		npc, npf := o.mset.store.NumPending(filter.currentSeq, filter.subject, isLastPerSubject)
+		npc, npf := o.mset.store.NumPending(filter.currentSeq, filter.subject.String(), isLastPerSubject)
 		o.npc += int64(npc)
 		if npf > o.npf {
 			o.npf = npf // Always last
@@ -4699,7 +4696,7 @@ func (o *consumer) selectStartingSeqNo() {
 				}
 				// If we are partitioned here this will be properly set when we become leader.
 				for _, filter := range o.subjf {
-					ss := o.mset.store.FilteredState(1, filter.subject)
+					ss := o.mset.store.FilteredState(1, filter.subject.String())
 					filter.nextSeq = ss.Last
 					if ss.Last > o.sseq {
 						o.sseq = ss.Last
@@ -4719,7 +4716,7 @@ func (o *consumer) selectStartingSeqNo() {
 						filters = append(filters, o.cfg.FilterSubject)
 					} else {
 						for _, filter := range o.subjf {
-							filters = append(filters, filter.subject)
+							filters = append(filters, filter.subject.String())
 						}
 					}
 					for _, filter := range filters {
@@ -5213,7 +5210,7 @@ func (o *consumer) signalSubs() []*subscription {
 	}
 
 	for _, filter := range o.subjf {
-		subs = append(subs, &subscription{subject: []byte(filter.subject), icb: o.processStreamSignal})
+		subs = append(subs, &subscription{subject: []byte(filter.subject.String()), icb: o.processStreamSignal})
 	}
 	o.sigSubs = subs
 	return subs
@@ -5244,16 +5241,16 @@ func (o *consumer) processStreamSignal(_ *subscription, _ *client, _ *Account, s
 }
 
 // Used to compare if two multiple filtered subject lists are equal.
-func subjectSliceEqual(slice1 []string, slice2 []string) bool {
+func subjectSliceEqual(slice1 []*subject.Subject, slice2 []*subject.Subject) bool {
 	if len(slice1) != len(slice2) {
 		return false
 	}
 	set2 := make(map[string]struct{}, len(slice2))
 	for _, val := range slice2 {
-		set2[val] = struct{}{}
+		set2[val.String()] = struct{}{}
 	}
 	for _, val := range slice1 {
-		if _, ok := set2[val]; !ok {
+		if _, ok := set2[val.String()]; !ok {
 			return false
 		}
 	}
@@ -5261,14 +5258,20 @@ func subjectSliceEqual(slice1 []string, slice2 []string) bool {
 }
 
 // Utility for simpler if conditions in Consumer config checks.
-// In future iteration, we can immediately create `o.subjf` and
-// use it to validate things.
-func gatherSubjectFilters(filter string, filters []string) []string {
-	if filter != _EMPTY_ {
-		filters = append(filters, filter)
+func gatherSubjectFilters(config *ConsumerConfig) ([]*subject.Subject, error) {
+	subjectFilters := make([]*subject.Subject, max(1, len(config.FilterSubjects)))
+	if subject, err := subject.New(config.FilterSubject); err == nil {
+		subjectFilters = append(subjectFilters, subject)
 	}
-	// list of filters should never contain non-empty filter.
-	return filters
+	for _, filter := range config.FilterSubjects {
+		subject, err := subject.New(filter)
+		if err != nil {
+			return nil, err
+		} else {
+			subjectFilters = append(subjectFilters, subject)
+		}
+	}
+	return subjectFilters, nil
 }
 
 // shouldStartMonitor will return true if we should start a monitor
