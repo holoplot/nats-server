@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"github.com/nats-io/nats-server/v2/server/avl"
+	"github.com/nats-io/nats-server/v2/subject"
 )
 
 // TODO(dlc) - This is a fairly simplistic approach but should do for now.
@@ -312,7 +313,7 @@ func (ms *memStore) GetSeqFromTime(t time.Time) uint64 {
 }
 
 // FilteredState will return the SimpleState associated with the filtered subject and a proposed starting sequence.
-func (ms *memStore) FilteredState(sseq uint64, subj string) SimpleState {
+func (ms *memStore) FilteredState(sseq uint64, subj *subject.Subject) SimpleState {
 	// This needs to be a write lock, as filteredStateLocked can
 	// mutate the per-subject state.
 	ms.mu.Lock()
@@ -321,7 +322,7 @@ func (ms *memStore) FilteredState(sseq uint64, subj string) SimpleState {
 	return ms.filteredStateLocked(sseq, subj, false)
 }
 
-func (ms *memStore) filteredStateLocked(sseq uint64, filter string, lastPerSubject bool) SimpleState {
+func (ms *memStore) filteredStateLocked(sseq uint64, filter *subject.Subject, lastPerSubject bool) SimpleState {
 	var ss SimpleState
 
 	if sseq < ms.state.FirstSeq {
@@ -333,7 +334,7 @@ func (ms *memStore) filteredStateLocked(sseq uint64, filter string, lastPerSubje
 		return ss
 	}
 
-	isAll := filter == _EMPTY_ || filter == fwcs
+	isAll := filter.IsEmpty() || filter.IsForwardWildcard()
 
 	// First check if we can optimize this part.
 	// This means we want all and the starting sequence was before this block.
@@ -349,11 +350,6 @@ func (ms *memStore) filteredStateLocked(sseq uint64, filter string, lastPerSubje
 		}
 	}
 
-	tsa := [32]string{}
-	fsa := [32]string{}
-	fts := tokenizeSubjectIntoSlice(fsa[:0], filter)
-	wc := subjectHasWildcard(filter)
-
 	// 1. See if we match any subs from fss.
 	// 2. If we match and the sseq is past ss.Last then we can use meta only.
 	// 3. If we match and we need to do a partial, break and clear any totals and do a full scan like num pending.
@@ -362,11 +358,13 @@ func (ms *memStore) filteredStateLocked(sseq uint64, filter string, lastPerSubje
 		if isAll {
 			return true
 		}
-		if !wc {
-			return subj == filter
+		if !filter.HasWildcard() {
+			return subj == filter.String()
 		}
-		tts := tokenizeSubjectIntoSlice(tsa[:0], subj)
-		return isSubsetMatchTokenized(tts, fts)
+		if s, err := subject.Stack(subj); err == nil {
+			return s.IsSubsetMatch(filter)
+		}
+		return false
 	}
 
 	update := func(fss *SimpleState) {
@@ -481,7 +479,7 @@ func (ms *memStore) filteredStateLocked(sseq uint64, filter string, lastPerSubje
 }
 
 // SubjectsState returns a map of SimpleState for all matching subjects.
-func (ms *memStore) SubjectsState(subject string) map[string]SimpleState {
+func (ms *memStore) SubjectsState(subject *subject.Subject) map[string]SimpleState {
 	ms.mu.RLock()
 	defer ms.mu.RUnlock()
 
@@ -491,7 +489,7 @@ func (ms *memStore) SubjectsState(subject string) map[string]SimpleState {
 
 	fss := make(map[string]SimpleState)
 	for subj, ss := range ms.fss {
-		if subject == _EMPTY_ || subject == fwcs || subjectIsSubsetMatch(subj, subject) {
+		if subject.IsEmpty() || subject.IsForwardWildcard() || subjectIsSubsetMatch(subj, subject) {
 			if ss.firstNeedsUpdate {
 				ms.recalculateFirstForSubj(subj, ss.First, ss)
 			}
@@ -536,7 +534,7 @@ func (ms *memStore) SubjectsTotals(filterSubject string) map[string]uint64 {
 }
 
 // NumPending will return the number of pending messages matching the filter subject starting at sequence.
-func (ms *memStore) NumPending(sseq uint64, filter string, lastPerSubject bool) (total, validThrough uint64) {
+func (ms *memStore) NumPending(sseq uint64, filter *subject.Subject, lastPerSubject bool) (total, validThrough uint64) {
 	// This needs to be a write lock, as filteredStateLocked can mutate the per-subject state.
 	ms.mu.Lock()
 	defer ms.mu.Unlock()
