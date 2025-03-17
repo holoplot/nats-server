@@ -8484,9 +8484,20 @@ func (mb *msgBlock) removeSeqPerSubject(subj string, seq uint64) {
 
 	ss.Msgs--
 
-	// We can lazily calculate the first/last sequence when needed.
-	ss.firstNeedsUpdate = seq == ss.First || ss.firstNeedsUpdate
-	ss.lastNeedsUpdate = seq == ss.Last || ss.lastNeedsUpdate
+	// Optimize for the case that MaxMsgPerSubject == 1.
+	if ss.Msgs == 1 {
+		if !ss.firstNeedsUpdate && seq == ss.First {
+			ss.First = ss.Last
+		}
+
+		if !ss.lastNeedsUpdate && seq == ss.Last {
+			ss.Last = ss.First
+		}
+	} else {
+		// We can lazily calculate the first/last sequence when needed.
+		ss.firstNeedsUpdate = seq == ss.First || ss.firstNeedsUpdate
+		ss.lastNeedsUpdate = seq == ss.Last || ss.lastNeedsUpdate
+	}
 }
 
 // Will recalculate the first and/or last sequence for this subject in this block.
