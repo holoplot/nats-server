@@ -1401,12 +1401,12 @@ func (ms *memStore) removeSeqPerSubject(subj string, seq uint64) {
 		if !ss.lastNeedsUpdate && seq != ss.Last {
 			ss.First = ss.Last
 			ss.firstNeedsUpdate = false
-			return false
+			return
 		}
 		if !ss.firstNeedsUpdate && seq != ss.First {
 			ss.Last = ss.First
 			ss.lastNeedsUpdate = false
-			return false
+			return
 		}
 	}
 
@@ -1414,7 +1414,7 @@ func (ms *memStore) removeSeqPerSubject(subj string, seq uint64) {
 	ss.firstNeedsUpdate = seq == ss.First || ss.firstNeedsUpdate
 	ss.lastNeedsUpdate = seq == ss.Last || ss.lastNeedsUpdate
 
-	return false
+	return
 }
 
 // Will recalculate the first and/or last sequence for this subject.
